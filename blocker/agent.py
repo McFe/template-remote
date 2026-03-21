@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import ctypes
+import difflib
 import json
 import locale
 import logging
@@ -12,6 +13,8 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from urllib import request
 from urllib.parse import urlparse, urlunparse
 
 import websockets
@@ -23,8 +26,11 @@ DEFAULT_STATUS_REPORT_INTERVAL_SECONDS = 30
 DEFAULT_LOG_LEVEL_NAME = "INFO"
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 MAX_COMMAND_TIMEOUT_SECONDS = 3600
+DEFAULT_SELF_UPDATE_INTERVAL_SECONDS = 600
+SELF_UPDATE_FETCH_TIMEOUT_SECONDS = 30
 LOG_TIMESTAMP_FORMAT = "%H:%M - %d.%m.%y"
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+SELF_PATH = Path(__file__).resolve()
 BLOCK_IP = "127.0.0.1"
 INSTANCE_MUTEX_NAME = "Global\\SiteBlockerRemoteAgent"
 AGENT_NAME = (
@@ -41,6 +47,7 @@ EXIT_CODE_INVALID_ACTION_PAYLOAD = 12
 EXIT_CODE_HOSTS_NOT_FOUND = 20
 EXIT_CODE_HOSTS_UNAVAILABLE = 21
 RELAY_WS_URL_OVERRIDE: str | None = None
+SELF_UPDATE_URL_OVERRIDE: str | None = None
 
 
 logging.basicConfig(
@@ -74,6 +81,10 @@ class AgentProcessError(RuntimeError):
         self.exit_code = exit_code
         self.error_code = error_code
         self.message = message
+
+
+class AgentRestartRequested(RuntimeError):
+    pass
 
 
 def _load_config() -> dict:
@@ -181,6 +192,18 @@ def load_relay_ws_url() -> str:
     return DEFAULT_RELAY_WS_URL
 
 
+def load_self_update_url() -> str:
+    if SELF_UPDATE_URL_OVERRIDE is not None:
+        return SELF_UPDATE_URL_OVERRIDE
+
+    update_url = os.environ.get("AGENT_UPDATE_URL", "").strip()
+    if update_url:
+        return update_url
+
+    config = _load_config()
+    return str(config.get("agent_update_url", "")).strip()
+
+
 def load_hosts_file() -> str:
     hosts_file = os.environ.get("HOSTS_FILE", "").strip()
     if hosts_file:
@@ -224,8 +247,39 @@ def load_status_report_interval_seconds() -> int:
     return interval_seconds
 
 
+def load_self_update_interval_seconds() -> int:
+    raw_value = os.environ.get("AGENT_UPDATE_INTERVAL_SECONDS", "").strip()
+    if not raw_value:
+        config = _load_config()
+        raw_value = str(config.get("agent_update_interval_seconds", "")).strip()
+
+    if not raw_value:
+        return DEFAULT_SELF_UPDATE_INTERVAL_SECONDS
+
+    try:
+        interval_seconds = int(raw_value)
+    except ValueError:
+        logging.warning(
+            "Ignoring invalid self-update interval %r; using %s seconds.",
+            raw_value,
+            DEFAULT_SELF_UPDATE_INTERVAL_SECONDS,
+        )
+        return DEFAULT_SELF_UPDATE_INTERVAL_SECONDS
+
+    if interval_seconds <= 0:
+        logging.warning(
+            "Ignoring non-positive self-update interval %r; using %s seconds.",
+            raw_value,
+            DEFAULT_SELF_UPDATE_INTERVAL_SECONDS,
+        )
+        return DEFAULT_SELF_UPDATE_INTERVAL_SECONDS
+
+    return interval_seconds
+
+
 HOSTS_FILE = load_hosts_file()
 STATUS_REPORT_INTERVAL_SECONDS = load_status_report_interval_seconds()
+SELF_UPDATE_INTERVAL_SECONDS = load_self_update_interval_seconds()
 
 
 def acquire_single_instance_lock():
@@ -285,6 +339,167 @@ def _normalize_command_shell(value: object) -> str:
     if shell in {"powershell", "powershell.exe"}:
         return "powershell"
     return ""
+
+
+def _normalize_source_text(value: str) -> str:
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _load_local_agent_source() -> str:
+    return _normalize_source_text(SELF_PATH.read_text(encoding="utf-8"))
+
+
+def _fetch_remote_agent_source(update_url: str) -> str:
+    update_request = request.Request(
+        update_url,
+        headers={"User-Agent": "site-block-agent-self-update"},
+    )
+    with request.urlopen(update_request, timeout=SELF_UPDATE_FETCH_TIMEOUT_SECONDS) as response:
+        return _normalize_source_text(response.read().decode("utf-8-sig"))
+
+
+def _powershell_literal(value: object) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _build_self_update_script(
+    *,
+    target_path: Path,
+    update_url: str,
+    script_path: Path,
+    current_pid: int,
+    executable_path: str,
+    argv: list[str],
+) -> str:
+    argv_json = json.dumps(argv)
+    return (
+        "$ErrorActionPreference = 'Stop'\n"
+        f"$targetPath = {_powershell_literal(target_path)}\n"
+        f"$updateUrl = {_powershell_literal(update_url)}\n"
+        f"$scriptPath = {_powershell_literal(script_path)}\n"
+        f"$pythonPath = {_powershell_literal(executable_path)}\n"
+        f"$workingDirectory = {_powershell_literal(str(target_path.parent))}\n"
+        "$downloadPath = [System.IO.Path]::GetTempFileName()\n"
+        "$argumentList = @()\n"
+        "$argvJson = @'\n"
+        f"{argv_json}\n"
+        "'@\n"
+        "$parsedArguments = ConvertFrom-Json -InputObject $argvJson\n"
+        "if ($parsedArguments) { $argumentList = [string[]]$parsedArguments }\n"
+        "try {\n"
+        f"    while (Get-Process -Id {current_pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 500 }}\n"
+        "    Invoke-WebRequest -Uri $updateUrl -Headers @{ 'User-Agent' = 'site-block-agent-self-update' } -OutFile $downloadPath\n"
+        "    $downloadedContents = [System.IO.File]::ReadAllText($downloadPath)\n"
+        "    $existingContents = ''\n"
+        "    if (Test-Path -LiteralPath $targetPath) { $existingContents = [System.IO.File]::ReadAllText($targetPath) }\n"
+        "    if ($downloadedContents -ne $existingContents) {\n"
+        "        Move-Item -LiteralPath $downloadPath -Destination $targetPath -Force\n"
+        "        $downloadPath = $null\n"
+        "    }\n"
+        "    Start-Process -FilePath $pythonPath -WorkingDirectory $workingDirectory -ArgumentList $argumentList -WindowStyle Hidden | Out-Null\n"
+        "} finally {\n"
+        "    if ($downloadPath -and (Test-Path -LiteralPath $downloadPath)) { Remove-Item -LiteralPath $downloadPath -Force }\n"
+        "    if (Test-Path -LiteralPath $scriptPath) { Remove-Item -LiteralPath $scriptPath -Force }\n"
+        "}\n"
+    )
+
+
+def _launch_self_update_script(script_path: Path) -> None:
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    subprocess.Popen(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+    )
+
+
+def _schedule_self_update(update_url: str) -> None:
+    script_path: Path | None = None
+
+    try:
+        with NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="\n",
+            suffix=".ps1",
+            prefix="site_block_agent_update_",
+            delete=False,
+        ) as handle:
+            script_path = Path(handle.name)
+            handle.write(
+                _build_self_update_script(
+                    target_path=SELF_PATH,
+                    update_url=update_url,
+                    script_path=script_path,
+                    current_pid=os.getpid(),
+                    executable_path=sys.executable,
+                    argv=sys.argv[1:],
+                )
+            )
+
+        _launch_self_update_script(script_path)
+    except Exception:
+        if script_path is not None and script_path.exists():
+            try:
+                script_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+async def _check_for_self_update() -> None:
+    update_url = load_self_update_url()
+    if not update_url:
+        return
+
+    try:
+        remote_source = await asyncio.to_thread(_fetch_remote_agent_source, update_url)
+        local_source = await asyncio.to_thread(_load_local_agent_source)
+    except Exception as exc:
+        logging.warning("Self-update check failed for %s: %s", update_url, exc)
+        return
+
+    if remote_source == local_source:
+        return
+
+    diff_line_count = sum(
+        1
+        for _line in difflib.unified_diff(
+            local_source.splitlines(),
+            remote_source.splitlines(),
+            fromfile=str(SELF_PATH),
+            tofile=update_url,
+            lineterm="",
+        )
+    )
+    logging.info(
+        "Detected updated agent.py from %s (%s diff line(s)). Scheduling self-update.",
+        update_url,
+        diff_line_count,
+    )
+
+    try:
+        await asyncio.to_thread(_schedule_self_update, update_url)
+    except Exception as exc:
+        logging.error("Failed to schedule self-update from %s: %s", update_url, exc)
+        return
+
+    raise AgentRestartRequested("Agent self-update scheduled.")
+
+
+async def _periodic_self_update_check() -> None:
+    while True:
+        await asyncio.sleep(SELF_UPDATE_INTERVAL_SECONDS)
+        await _check_for_self_update()
 
 
 def _hosts_line(domain: str) -> str:
@@ -943,15 +1158,18 @@ async def listen() -> None:
             try:
                 status_task = None
                 log_task = None
+                self_update_task = None
                 receive_task = None
                 await _report_current_status(ws)
                 status_task = asyncio.create_task(_periodic_status_report(ws))
                 log_task = asyncio.create_task(_forward_log_messages(ws))
+                if load_self_update_url():
+                    self_update_task = asyncio.create_task(_periodic_self_update_check())
                 receive_task = asyncio.create_task(ws.recv())
                 try:
                     while True:
                         done, _pending = await asyncio.wait(
-                            {status_task, log_task, receive_task},
+                            {task for task in (status_task, log_task, self_update_task, receive_task) if task is not None},
                             return_when=asyncio.FIRST_COMPLETED,
                         )
 
@@ -960,6 +1178,9 @@ async def listen() -> None:
 
                         if log_task in done:
                             await log_task
+
+                        if self_update_task in done:
+                            await self_update_task
 
                         if receive_task in done:
                             try:
@@ -1002,11 +1223,17 @@ async def listen() -> None:
                             await _handle_relay_message(ws, data)
                             receive_task = asyncio.create_task(ws.recv())
                 finally:
-                    tasks = [task for task in (status_task, log_task, receive_task) if task is not None]
+                    tasks = [
+                        task
+                        for task in (status_task, log_task, self_update_task, receive_task)
+                        if task is not None
+                    ]
                     for task in tasks:
                         task.cancel()
                     if tasks:
                         await asyncio.gather(*tasks, return_exceptions=True)
+            except AgentRestartRequested:
+                raise
             except AgentProcessError:
                 raise
             except Exception as exc:
@@ -1016,6 +1243,8 @@ async def listen() -> None:
                     error_code="agent_runtime_failure",
                     message=f"Agent encountered a fatal runtime error: {exc}",
                 )
+    except AgentRestartRequested:
+        raise
     except AgentProcessError:
         raise
     except Exception as exc:
@@ -1031,10 +1260,14 @@ async def run_forever() -> None:
 
 
 def _apply_cli_overrides(args: argparse.Namespace) -> None:
-    global AGENT_NAME, HOSTS_FILE, RELAY_WS_URL_OVERRIDE, STATUS_REPORT_INTERVAL_SECONDS
+    global AGENT_NAME, HOSTS_FILE, RELAY_WS_URL_OVERRIDE, SELF_UPDATE_INTERVAL_SECONDS
+    global SELF_UPDATE_URL_OVERRIDE, STATUS_REPORT_INTERVAL_SECONDS
 
     if getattr(args, "relay_url", None):
         RELAY_WS_URL_OVERRIDE = _coerce_ws_url(str(args.relay_url).strip())
+
+    if getattr(args, "self_update_url", None) is not None:
+        SELF_UPDATE_URL_OVERRIDE = str(args.self_update_url).strip()
 
     if getattr(args, "hosts_file", None):
         HOSTS_FILE = str(args.hosts_file).strip()
@@ -1044,6 +1277,12 @@ def _apply_cli_overrides(args: argparse.Namespace) -> None:
         if status_report_interval <= 0:
             raise SystemExit("--status-report-interval must be greater than 0.")
         STATUS_REPORT_INTERVAL_SECONDS = status_report_interval
+
+    self_update_interval = getattr(args, "self_update_interval", None)
+    if self_update_interval is not None:
+        if self_update_interval <= 0:
+            raise SystemExit("--self-update-interval must be greater than 0.")
+        SELF_UPDATE_INTERVAL_SECONDS = self_update_interval
 
     if getattr(args, "log_level", None):
         logging.getLogger().setLevel(getattr(logging, str(args.log_level).upper()))
@@ -1065,10 +1304,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override the hosts file path for this run.",
     )
     parser.add_argument(
+        "--self-update-url",
+        help="Raw URL used to fetch updated blocker/agent.py contents for self-update.",
+    )
+    parser.add_argument(
         "--status-report-interval",
         type=int,
         metavar="SECONDS",
         help="Override the status report interval for this run.",
+    )
+    parser.add_argument(
+        "--self-update-interval",
+        type=int,
+        metavar="SECONDS",
+        help="Override the self-update polling interval for this run.",
     )
     parser.add_argument(
         "--log-level",
@@ -1103,6 +1352,9 @@ def main() -> int:
     try:
         try:
             asyncio.run(run_forever())
+        except AgentRestartRequested as exc:
+            logging.info("%s", exc)
+            return 0
         except AgentProcessError as exc:
             logging.error("Agent exiting with code %s (%s): %s", exc.exit_code, exc.error_code, exc.message)
             return exc.exit_code

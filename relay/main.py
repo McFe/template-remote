@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -15,14 +16,16 @@ from tempfile import NamedTemporaryFile
 from urllib.parse import urlparse
 
 import h11
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 
 DATA_FILE = Path(__file__).parent / "blocked_urls.json"
 AGENT_LOG_FILE = Path(__file__).parent / "agent_logs.log"
 COMMAND_LOG_FILE = Path(__file__).parent / "command_output.log"
+REPO_ROOT = Path(__file__).resolve().parents[1]
 URLS_LOCK = asyncio.Lock()
+PULL_LOCK = asyncio.Lock()
 relay_logger = logging.getLogger("site_blocker.relay")
 ACTION_ACK_TIMEOUT_SECONDS = 5
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
@@ -35,6 +38,10 @@ LEGACY_AGENT_LOG_PREFIX_RE = re.compile(
 
 
 class StorageError(RuntimeError):
+    pass
+
+
+class PullError(RuntimeError):
     pass
 
 
@@ -444,6 +451,19 @@ def load_blocked_domains_or_raise_api() -> list[str]:
         return []
 
 
+def load_pull_token() -> str:
+    return os.environ.get("PULL_TOKEN", "").strip()
+
+
+def require_pull_authorization(provided_token: str | None) -> None:
+    expected_token = load_pull_token()
+    if not expected_token:
+        return
+
+    if str(provided_token or "").strip() != expected_token:
+        raise_api_error(403, "invalid_pull_token", "Missing or invalid pull token.")
+
+
 def get_required_target_connection() -> WebSocket:
     active_connections = tuple(manager.active_connections.items())
     if not active_connections:
@@ -639,6 +659,33 @@ def get_requested_command(payload: CommandPayload) -> tuple[str, list[str], int]
     return shell, arguments, timeout_seconds
 
 
+def run_git_pull(repo_root: Path) -> dict[str, str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "pull", "--ff-only"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        raise PullError(f"Failed to execute git pull in {repo_root}: {exc}") from exc
+
+    combined_output = "\n".join(
+        part.strip()
+        for part in (result.stdout, result.stderr)
+        if isinstance(part, str) and part.strip()
+    ).strip()
+    if not combined_output:
+        combined_output = "git pull completed with no output."
+
+    if result.returncode != 0:
+        raise PullError(combined_output)
+
+    return {"output": combined_output}
+
+
 async def rollback_agent_domains(connection: WebSocket, domains: list[str]) -> str | None:
     request_id = str(uuid.uuid4())
 
@@ -783,6 +830,27 @@ async def list_domains() -> dict[str, list[str]]:
 @app.get("/agent-logs")
 async def list_agent_logs() -> dict[str, list[str]]:
     return {"logs": read_recent_agent_logs()}
+
+
+@app.post("/pull")
+async def pull_repository(x_pull_token: str | None = Header(default=None, alias="X-Pull-Token")) -> dict[str, str]:
+    require_pull_authorization(x_pull_token)
+
+    async with PULL_LOCK:
+        try:
+            result = await asyncio.to_thread(run_git_pull, REPO_ROOT)
+        except PullError as exc:
+            relay_logger.error("git pull failed: %s", exc)
+            raise_api_error(500, "pull_failed", str(exc))
+            return {"status": "error", "message": str(exc), "output": ""}
+
+    output = result["output"]
+    relay_logger.info("git pull completed: %s", output.replace("\n", " | "))
+    return {
+        "status": "ok",
+        "message": "git pull completed successfully.",
+        "output": output,
+    }
 
 
 @app.get("/command-logs")

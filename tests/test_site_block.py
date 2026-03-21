@@ -244,10 +244,39 @@ class RelayContractTests(unittest.TestCase):
         self.assertEqual(response_data["shell"], "cmd")
         self.assertEqual(response_data["arguments"], ["/c", "exit", "1"])
 
+    def test_pull_endpoint_returns_git_output(self) -> None:
+        with patch.object(relay_main, "run_git_pull", return_value={"output": "Already up to date."}):
+            response = self.client.post("/pull")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "ok",
+                "message": "git pull completed successfully.",
+                "output": "Already up to date.",
+            },
+        )
+
+    def test_pull_endpoint_requires_token_when_configured(self) -> None:
+        with patch.dict(os.environ, {"PULL_TOKEN": "secret-token"}, clear=False):
+            response = self.client.post("/pull")
+            self.assertEqual(response.status_code, 403, response.text)
+
+            with patch.object(relay_main, "run_git_pull", return_value={"output": "Already up to date."}):
+                authorized_response = self.client.post(
+                    "/pull",
+                    headers={"X-Pull-Token": "secret-token"},
+                )
+
+        self.assertEqual(authorized_response.status_code, 200, authorized_response.text)
+
 
 class AgentCompatibilityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_hosts_file = blocker_agent.HOSTS_FILE
+        self.original_self_update_url_override = blocker_agent.SELF_UPDATE_URL_OVERRIDE
+        self.original_self_update_interval_seconds = blocker_agent.SELF_UPDATE_INTERVAL_SECONDS
         fd, hosts_path = tempfile.mkstemp(prefix="site_block_hosts_", text=True)
         os.close(fd)
         self.hosts_path = hosts_path
@@ -256,6 +285,8 @@ class AgentCompatibilityTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         blocker_agent.HOSTS_FILE = self.original_hosts_file
+        blocker_agent.SELF_UPDATE_URL_OVERRIDE = self.original_self_update_url_override
+        blocker_agent.SELF_UPDATE_INTERVAL_SECONDS = self.original_self_update_interval_seconds
         if os.path.exists(self.hosts_path):
             os.unlink(self.hosts_path)
         blocker_agent.PENDING_LOG_MESSAGES.clear()
@@ -379,6 +410,38 @@ class AgentCompatibilityTests(unittest.TestCase):
             self.assertEqual(payloads[1]["exit_code"], 0)
 
         asyncio.run(run_command())
+
+    def test_self_update_script_replaces_agent_and_restarts(self) -> None:
+        script = blocker_agent._build_self_update_script(
+            target_path=Path("C:/site block/blocker/agent.py"),
+            update_url="https://example.test/blocker/agent.py",
+            script_path=Path("C:/Temp/update_agent.ps1"),
+            current_pid=1234,
+            executable_path="C:/Python/pythonw.exe",
+            argv=["--relay-url", "ws://example/ws"],
+        )
+
+        self.assertIn("Invoke-WebRequest -Uri $updateUrl", script)
+        self.assertIn("$downloadPath = [System.IO.Path]::GetTempFileName()", script)
+        self.assertIn("Move-Item -LiteralPath $downloadPath -Destination $targetPath -Force", script)
+        self.assertIn("Start-Process -FilePath $pythonPath", script)
+        self.assertIn('["--relay-url", "ws://example/ws"]', script)
+        self.assertIn("Get-Process -Id 1234", script)
+
+    def test_check_for_self_update_schedules_restart(self) -> None:
+        blocker_agent.SELF_UPDATE_URL_OVERRIDE = "https://example.test/blocker/agent.py"
+
+        async def run_check() -> None:
+            with patch.object(blocker_agent, "_fetch_remote_agent_source", return_value="new version\n") as fetch_source:
+                with patch.object(blocker_agent, "_load_local_agent_source", return_value="old version\n"):
+                    with patch.object(blocker_agent, "_schedule_self_update") as schedule_update:
+                        with self.assertRaises(blocker_agent.AgentRestartRequested):
+                            await blocker_agent._check_for_self_update()
+
+            fetch_source.assert_called_once_with("https://example.test/blocker/agent.py")
+            schedule_update.assert_called_once_with("https://example.test/blocker/agent.py")
+
+        asyncio.run(run_check())
 
     def test_main_returns_non_zero_on_fatal_error(self) -> None:
         async def failing_run_forever() -> None:

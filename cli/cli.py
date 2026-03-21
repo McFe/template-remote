@@ -45,6 +45,28 @@ def load_relay_url():
     raise SystemExit(1)
 
 
+def load_pull_token():
+    pull_token = os.environ.get("PULL_TOKEN", "").strip()
+    if pull_token:
+        return pull_token
+
+    if CONFIG_PATH.exists():
+        try:
+            config_data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(f"Failed to read config file at {CONFIG_PATH}: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        except json.JSONDecodeError as exc:
+            print(f"Failed to parse JSON in {CONFIG_PATH}: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+
+        pull_token = str(config_data.get("pull_token", "")).strip()
+        if pull_token:
+            return pull_token
+
+    return ""
+
+
 def get_relay_http_error_message(exc):
     error_body = exc.read().decode("utf-8", errors="replace")
 
@@ -64,9 +86,11 @@ def get_relay_http_error_message(exc):
     return f"Relay returned HTTP {exc.code}: {message}"
 
 
-def relay_request(method, base_url, path, payload=None):
+def relay_request(method, base_url, path, payload=None, extra_headers=None):
     data = None
     headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
 
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
@@ -221,6 +245,26 @@ def handle_erase(_args, base_url):
     print("Erased hosts file.")
 
 
+def handle_pull(_args, base_url):
+    extra_headers = {}
+    pull_token = load_pull_token()
+    if pull_token:
+        extra_headers["X-Pull-Token"] = pull_token
+
+    try:
+        response_data = relay_request("POST", base_url, "/pull", extra_headers=extra_headers)
+    except RelayRequestError as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(1)
+
+    output = str(response_data.get("output", "")).strip()
+    if output:
+        print(output)
+        return
+
+    print(str(response_data.get("message", "git pull completed successfully.")))
+
+
 def handle_run(args, base_url):
     arguments = list(args.arguments)
     timeout = None
@@ -306,6 +350,12 @@ def build_parser():
         help="Erase the hosts file and clear the relay block list.",
     )
     erase_parser.set_defaults(handler=handle_erase)
+
+    pull_parser = subparsers.add_parser(
+        "pull",
+        help="Trigger relay-side git pull --ff-only.",
+    )
+    pull_parser.set_defaults(handler=handle_pull)
 
     run_parser = subparsers.add_parser(
         "run",

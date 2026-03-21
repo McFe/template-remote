@@ -25,7 +25,7 @@ site block/
 
 ## How It Works
 
-1. A client sends `block`, `unblock`, `refresh`, `erase`, or `run` requests to the relay.
+1. A client sends `block`, `unblock`, `refresh`, `erase`, `run`, or `pull` requests to the relay.
 2. The relay requires exactly one connected, non-error blocker agent for mutating operations.
 3. The relay sends the requested action to the agent and waits for the agent to confirm it.
 4. Only after confirmation does the relay persist the new hostname list to `relay/blocked_urls.json`.
@@ -43,6 +43,7 @@ The relay is a FastAPI app in `relay/main.py`. It serves:
 - `GET /list`
 - `GET /agent-logs`
 - `GET /command-logs`
+- `POST /pull`
 - `POST /block`
 - `POST /unblock`
 - `POST /refresh`
@@ -55,9 +56,11 @@ Important relay behavior:
 - `relay/blocked_urls.json` stores canonical lowercase hostnames only.
 - `relay/agent_logs.log` stores agent logs as plain text lines formatted like `[HH:MM - DD.MM.YY] [agent-name] LEVEL message`.
 - `relay/command_output.log` stores command output lines as plain text lines formatted like `[HH:MM - DD.MM.YY] [agent-name] [request-id] [shell] STREAM message`.
+- `POST /pull` runs `git pull --ff-only` in the relay repository root.
 - Missing `blocked_urls.json` is treated as an empty block list.
 - Invalid or unreadable `blocked_urls.json` is treated as a server error.
 - State-changing operations are transactional against the connected agent.
+- If the `PULL_TOKEN` environment variable is set on the relay, `POST /pull` requires the same token in the `X-Pull-Token` header.
 - Batch endpoints are not exposed; callers should issue concurrent single-item requests instead.
 
 ### Blocker Agent
@@ -69,6 +72,7 @@ The blocker agent in `blocker/agent.py`:
 - rewrites the file to match the relay hostname list
 - flushes DNS after changes with `ipconfig /flushdns`
 - can run hidden `cmd.exe` or `powershell.exe` child processes under the agent's Windows security context and stream their output back to the relay
+- can poll a configured raw GitHub `blocker/agent.py` URL and self-update every 10 minutes by launching a temp PowerShell updater script that fetches and replaces `agent.py`
 - exits on fatal runtime, relay, or hosts-file failures
 - sends a best-effort `agent_exit` notice to the relay before terminating when the WebSocket is still available
 - enforces a single local agent instance with a Windows mutex
@@ -92,6 +96,7 @@ The agent accepts both legacy `url` / `urls` fields and canonical `domain` / `do
 - is configured to restart on failure
 
 If you need a relay URL other than the hardcoded default, configure `RELAY_WS_URL` or `RELAY_URL` as a system environment variable before boot, or update the default in `blocker/agent.py` before installing.
+If you want the agent to self-update from GitHub, configure `AGENT_UPDATE_URL` to the raw `blocker/agent.py` URL and optionally `AGENT_UPDATE_INTERVAL_SECONDS` to change the 10-minute default.
 
 ### CLI
 
@@ -102,6 +107,7 @@ The CLI in `cli/cli.py` uses only the Python standard library. It supports:
 - `list`
 - `refresh`
 - `erase`
+- `pull`
 - `run <cmd|powershell> [arguments ...]`
 
 CLI behavior:
@@ -110,6 +116,7 @@ CLI behavior:
 - multi-item operations fan out concurrent single-item requests client-side
 - mixed success is reported item-by-item
 - the CLI exits non-zero if any requested item fails
+- `pull` triggers relay-side `git pull --ff-only`
 - `run` waits for the command to finish and exits non-zero if the command fails or times out
 - `run` command output is written by the relay to `relay/command_output.log`
 
@@ -157,6 +164,7 @@ The relay then exposes:
 - `http://<host>:8000/unblock`
 - `http://<host>:8000/refresh`
 - `http://<host>:8000/erase`
+- `http://<host>:8000/pull`
 - `http://<host>:8000/agent-logs`
 - `http://<host>:8000/command-logs`
 - `ws://<host>:8000/ws`
@@ -182,7 +190,8 @@ For startup installation as a scheduled task, run PowerShell as Administrator an
 
 ```powershell
 $env:RELAY_WS_URL = "ws://your-server:8000/ws"
-.\install.bat
+$env:AGENT_UPDATE_URL = "https://raw.githubusercontent.com/<owner>/<repo>/<branch>/blocker/agent.py"
+.\install.bat --self-update-url $env:AGENT_UPDATE_URL --self-update-interval 600
 ```
 
 ### 3. Configure and Use the CLI
@@ -200,6 +209,7 @@ python cli\cli.py block https://reddit.com
 python cli\cli.py unblock reddit.com
 python cli\cli.py list
 python cli\cli.py refresh
+python cli\cli.py pull
 python cli\cli.py run cmd /c whoami
 python cli\cli.py run powershell -Command Get-Date
 python cli\cli.py run powershell --timeout 30 -Command Get-Date
@@ -282,6 +292,18 @@ Response:
 }
 ```
 
+`POST /pull`
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "message": "git pull completed successfully.",
+  "output": "Already up to date."
+}
+```
+
 `POST /run`
 
 Request:
@@ -339,8 +361,10 @@ Messages sent by the relay:
 ## Operational Notes
 
 - The relay has no authentication or authorization. Run it only in a trusted environment unless you add your own controls.
+- `.github/workflows/pull.yml` now supports manual dispatch only. It no longer uses a scheduled cron trigger.
 - Only one deployed agent is supported. If multiple agents connect, mutating relay operations fail with `503`.
 - The agent intentionally owns the entire `hosts` file. `refresh` and `init` rewrite the file to match the relay state, and `erase` truncates it completely.
 - `run` executes hidden child processes through the connected agent. When the agent is installed through the scheduled task, those commands run as `SYSTEM`.
+- To enable agent self-update, point `AGENT_UPDATE_URL` or `agent_update_url` at the raw GitHub copy of `blocker/agent.py`.
 - The agent does not self-heal in-process. Any fatal failure ends the process and is expected to be recovered by the scheduled task restart policy.
 - Before deploying this version, ensure `relay/blocked_urls.json` contains canonical lowercase hostnames only.
