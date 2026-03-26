@@ -23,10 +23,11 @@ import websockets
 DEFAULT_RELAY_WS_URL = "ws://188.195.200.62:8000/ws"
 DEFAULT_HOSTS_FILE = r"C:\Windows\System32\drivers\etc\hosts"
 DEFAULT_STATUS_REPORT_INTERVAL_SECONDS = 30
-DEFAULT_LOG_LEVEL_NAME = "INFO"
+DEFAULT_LOG_LEVEL_NAME = "VERBOSE"
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 300
 MAX_COMMAND_TIMEOUT_SECONDS = 3600
 DEFAULT_SELF_UPDATE_INTERVAL_SECONDS = 600
+DEFAULT_RELAY_RECONNECT_DELAY_SECONDS = 10
 SELF_UPDATE_FETCH_TIMEOUT_SECONDS = 30
 LOG_TIMESTAMP_FORMAT = "%H:%M - %d.%m.%y"
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -50,8 +51,26 @@ RELAY_WS_URL_OVERRIDE: str | None = None
 SELF_UPDATE_URL_OVERRIDE: str | None = None
 
 
+def _install_verbose_log_level() -> None:
+    if hasattr(logging, "VERBOSE"):
+        return
+
+    verbose_level = logging.INFO - 5
+    logging.addLevelName(verbose_level, "VERBOSE")
+    logging.VERBOSE = verbose_level
+
+    def verbose(self, message, *args, **kwargs):
+        if self.isEnabledFor(verbose_level):
+            self._log(verbose_level, message, args, **kwargs)
+
+    logging.Logger.verbose = verbose
+
+
+_install_verbose_log_level()
+
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.VERBOSE,
     format="[%(asctime)s] %(levelname)s %(message)s",
     datefmt=LOG_TIMESTAMP_FORMAT,
 )
@@ -114,7 +133,7 @@ def load_log_level_name() -> str:
         return DEFAULT_LOG_LEVEL_NAME
 
     log_level_name = raw_value.upper()
-    if log_level_name not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
+    if log_level_name not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "VERBOSE"}:
         logging.warning(
             "Ignoring invalid log level %r; using %s.",
             raw_value,
@@ -277,9 +296,40 @@ def load_self_update_interval_seconds() -> int:
     return interval_seconds
 
 
+def load_relay_reconnect_delay_seconds() -> int:
+    raw_value = os.environ.get("RELAY_RECONNECT_DELAY_SECONDS", "").strip()
+    if not raw_value:
+        config = _load_config()
+        raw_value = str(config.get("relay_reconnect_delay_seconds", "")).strip()
+
+    if not raw_value:
+        return DEFAULT_RELAY_RECONNECT_DELAY_SECONDS
+
+    try:
+        interval_seconds = int(raw_value)
+    except ValueError:
+        logging.warning(
+            "Ignoring invalid relay reconnect delay %r; using %s seconds.",
+            raw_value,
+            DEFAULT_RELAY_RECONNECT_DELAY_SECONDS,
+        )
+        return DEFAULT_RELAY_RECONNECT_DELAY_SECONDS
+
+    if interval_seconds <= 0:
+        logging.warning(
+            "Ignoring non-positive relay reconnect delay %r; using %s seconds.",
+            raw_value,
+            DEFAULT_RELAY_RECONNECT_DELAY_SECONDS,
+        )
+        return DEFAULT_RELAY_RECONNECT_DELAY_SECONDS
+
+    return interval_seconds
+
+
 HOSTS_FILE = load_hosts_file()
 STATUS_REPORT_INTERVAL_SECONDS = load_status_report_interval_seconds()
 SELF_UPDATE_INTERVAL_SECONDS = load_self_update_interval_seconds()
+RELAY_RECONNECT_DELAY_SECONDS = load_relay_reconnect_delay_seconds()
 
 
 def acquire_single_instance_lock():
@@ -309,6 +359,31 @@ def _hosts_file_exists() -> bool:
 def _require_hosts_file() -> None:
     if not _hosts_file_exists():
         raise FileNotFoundError(f"Hosts file not found at {HOSTS_FILE}")
+
+
+def _is_relay_transport_error(exc: BaseException) -> bool:
+    websocket_exceptions = getattr(websockets, "exceptions", None)
+    connection_closed_type = getattr(websocket_exceptions, "ConnectionClosed", ())
+    websocket_exception_type = getattr(websocket_exceptions, "WebSocketException", ())
+    transport_error_types = tuple(
+        error_type
+        for error_type in (connection_closed_type, websocket_exception_type, ConnectionError, OSError, EOFError)
+        if isinstance(error_type, type)
+    )
+    return isinstance(exc, transport_error_types)
+
+
+async def _send_json_payload(ws, payload: dict[str, object]) -> None:
+    try:
+        await ws.send(json.dumps(payload))
+    except Exception as exc:
+        if _is_relay_transport_error(exc):
+            raise AgentProcessError(
+                exit_code=EXIT_CODE_RELAY_CONNECTION_FAILURE,
+                error_code="relay_connection_failed",
+                message=f"Relay connection failed while sending a message: {exc}",
+            ) from exc
+        raise
 
 
 def _is_valid_hostname(hostname: str) -> bool:
@@ -748,7 +823,7 @@ async def _send_agent_status(
     if domains is not None:
         payload["domains"] = domains
 
-    await ws.send(json.dumps(payload))
+    await _send_json_payload(ws, payload)
 
 
 async def _send_action_result(
@@ -776,7 +851,7 @@ async def _send_action_result(
     if extra_fields:
         payload.update(extra_fields)
 
-    await ws.send(json.dumps(payload))
+    await _send_json_payload(ws, payload)
 
 
 async def _send_agent_exit(
@@ -794,7 +869,7 @@ async def _send_agent_exit(
         "message": message,
         "created": time.time(),
     }
-    await ws.send(json.dumps(payload))
+    await _send_json_payload(ws, payload)
 
 
 async def _send_command_output(
@@ -817,7 +892,7 @@ async def _send_command_output(
         "message": message,
         "created": time.time(),
     }
-    await ws.send(json.dumps(payload))
+    await _send_json_payload(ws, payload)
 
 
 async def _raise_agent_failure(
@@ -1044,7 +1119,7 @@ async def _forward_log_messages(ws) -> None:
         while PENDING_LOG_MESSAGES:
             payload = {"type": "agent_log", "agent_name": AGENT_NAME}
             payload.update(PENDING_LOG_MESSAGES.popleft())
-            await ws.send(json.dumps(payload))
+            await _send_json_payload(ws, payload)
 
         await asyncio.sleep(1)
 
@@ -1188,11 +1263,13 @@ async def listen() -> None:
                             except AgentProcessError:
                                 raise
                             except Exception as exc:
-                                raise AgentProcessError(
-                                    exit_code=EXIT_CODE_RELAY_CONNECTION_FAILURE,
-                                    error_code="relay_connection_failed",
-                                    message=f"Relay connection failed: {exc}",
-                                ) from exc
+                                if _is_relay_transport_error(exc):
+                                    raise AgentProcessError(
+                                        exit_code=EXIT_CODE_RELAY_CONNECTION_FAILURE,
+                                        error_code="relay_connection_failed",
+                                        message=f"Relay connection failed: {exc}",
+                                    ) from exc
+                                raise
 
                             if not isinstance(raw_message, str):
                                 await _raise_agent_failure(
@@ -1256,11 +1333,27 @@ async def listen() -> None:
 
 
 async def run_forever() -> None:
-    await listen()
+    while True:
+        try:
+            await listen()
+            return
+        except AgentRestartRequested:
+            raise
+        except AgentProcessError as exc:
+            if exc.error_code != "relay_connection_failed":
+                raise
+
+            logging.warning(
+                "%s Retrying in %s seconds.",
+                exc.message,
+                RELAY_RECONNECT_DELAY_SECONDS,
+            )
+            await asyncio.sleep(RELAY_RECONNECT_DELAY_SECONDS)
 
 
 def _apply_cli_overrides(args: argparse.Namespace) -> None:
-    global AGENT_NAME, HOSTS_FILE, RELAY_WS_URL_OVERRIDE, SELF_UPDATE_INTERVAL_SECONDS
+    global AGENT_NAME, HOSTS_FILE, RELAY_RECONNECT_DELAY_SECONDS, RELAY_WS_URL_OVERRIDE
+    global SELF_UPDATE_INTERVAL_SECONDS
     global SELF_UPDATE_URL_OVERRIDE, STATUS_REPORT_INTERVAL_SECONDS
 
     if getattr(args, "relay_url", None):
@@ -1283,6 +1376,12 @@ def _apply_cli_overrides(args: argparse.Namespace) -> None:
         if self_update_interval <= 0:
             raise SystemExit("--self-update-interval must be greater than 0.")
         SELF_UPDATE_INTERVAL_SECONDS = self_update_interval
+
+    relay_reconnect_delay = getattr(args, "relay_reconnect_delay", None)
+    if relay_reconnect_delay is not None:
+        if relay_reconnect_delay <= 0:
+            raise SystemExit("--relay-reconnect-delay must be greater than 0.")
+        RELAY_RECONNECT_DELAY_SECONDS = relay_reconnect_delay
 
     if getattr(args, "log_level", None):
         logging.getLogger().setLevel(getattr(logging, str(args.log_level).upper()))
@@ -1320,8 +1419,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override the self-update polling interval for this run.",
     )
     parser.add_argument(
+        "--relay-reconnect-delay",
+        type=int,
+        metavar="SECONDS",
+        help="Override the relay reconnect delay after transport failures for this run.",
+    )
+    parser.add_argument(
         "--log-level",
-        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"],
+        choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "VERBOSE"],
         help="Override the log level for this run.",
     )
     parser.add_argument(

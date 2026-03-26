@@ -30,7 +30,7 @@ site block/
 3. The relay sends the requested action to the agent and waits for the agent to confirm it.
 4. Only after confirmation does the relay persist the new hostname list to `relay/blocked_urls.json`.
 5. On connect, the relay sends the full canonical hostname list so the agent can reconcile the local `hosts` file.
-6. If the agent hits a fatal runtime, relay, or hosts-file error, it exits so the Windows scheduled task can restart it cleanly.
+6. If the agent loses the relay connection, it retries in-process after a short delay. Fatal runtime, payload, or hosts-file errors still terminate the process.
 
 The relay stores only lowercase hostnames. Inputs such as `reddit.com`, `https://reddit.com`, and `https://reddit.com/r/python` all normalize to `reddit.com`.
 
@@ -73,7 +73,7 @@ The blocker agent in `blocker/agent.py`:
 - flushes DNS after changes with `ipconfig /flushdns`
 - can run hidden `cmd.exe` or `powershell.exe` child processes under the agent's Windows security context and stream their output back to the relay
 - can poll a configured raw GitHub `blocker/agent.py` URL and self-update every 10 minutes by launching a temp PowerShell updater script that fetches and replaces `agent.py`
-- exits on fatal runtime, relay, or hosts-file failures
+- retries relay transport failures in-process and exits on fatal runtime, payload, or hosts-file failures
 - sends a best-effort `agent_exit` notice to the relay before terminating when the WebSocket is still available
 - enforces a single local agent instance with a Windows mutex
 
@@ -97,6 +97,7 @@ The agent accepts both legacy `url` / `urls` fields and canonical `domain` / `do
 
 If you need a relay URL other than the hardcoded default, configure `RELAY_WS_URL` or `RELAY_URL` as a system environment variable before boot, or update the default in `blocker/agent.py` before installing.
 If you want the agent to self-update from GitHub, configure `AGENT_UPDATE_URL` to the raw `blocker/agent.py` URL and optionally `AGENT_UPDATE_INTERVAL_SECONDS` to change the 10-minute default.
+If you want to change the reconnect delay after relay transport failures, configure `RELAY_RECONNECT_DELAY_SECONDS` or use `--relay-reconnect-delay`.
 
 ### CLI
 

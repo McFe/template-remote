@@ -275,6 +275,7 @@ class RelayContractTests(unittest.TestCase):
 class AgentCompatibilityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_hosts_file = blocker_agent.HOSTS_FILE
+        self.original_relay_reconnect_delay_seconds = blocker_agent.RELAY_RECONNECT_DELAY_SECONDS
         self.original_self_update_url_override = blocker_agent.SELF_UPDATE_URL_OVERRIDE
         self.original_self_update_interval_seconds = blocker_agent.SELF_UPDATE_INTERVAL_SECONDS
         fd, hosts_path = tempfile.mkstemp(prefix="site_block_hosts_", text=True)
@@ -285,6 +286,7 @@ class AgentCompatibilityTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         blocker_agent.HOSTS_FILE = self.original_hosts_file
+        blocker_agent.RELAY_RECONNECT_DELAY_SECONDS = self.original_relay_reconnect_delay_seconds
         blocker_agent.SELF_UPDATE_URL_OVERRIDE = self.original_self_update_url_override
         blocker_agent.SELF_UPDATE_INTERVAL_SECONDS = self.original_self_update_interval_seconds
         if os.path.exists(self.hosts_path):
@@ -462,6 +464,52 @@ class AgentCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(exit_code, blocker_agent.EXIT_CODE_INVALID_RELAY_MESSAGE)
         release_lock.assert_called_once_with("lock-handle")
+
+    def test_run_forever_retries_relay_connection_failures(self) -> None:
+        blocker_agent.RELAY_RECONNECT_DELAY_SECONDS = 7
+        listen_mock = AsyncMock(
+            side_effect=[
+                blocker_agent.AgentProcessError(
+                    exit_code=blocker_agent.EXIT_CODE_RELAY_CONNECTION_FAILURE,
+                    error_code="relay_connection_failed",
+                    message="Relay connection failed: socket closed",
+                ),
+                None,
+            ]
+        )
+        sleep_mock = AsyncMock()
+
+        async def run_check() -> None:
+            with patch.object(blocker_agent, "listen", listen_mock):
+                with patch.object(blocker_agent.asyncio, "sleep", sleep_mock):
+                    await blocker_agent.run_forever()
+
+        asyncio.run(run_check())
+
+        self.assertEqual(listen_mock.await_count, 2)
+        sleep_mock.assert_awaited_once_with(7)
+
+    def test_run_forever_re_raises_non_relay_failures(self) -> None:
+        listen_mock = AsyncMock(
+            side_effect=blocker_agent.AgentProcessError(
+                exit_code=blocker_agent.EXIT_CODE_HOSTS_UNAVAILABLE,
+                error_code="hosts_unavailable",
+                message="Hosts file write failed.",
+            )
+        )
+        sleep_mock = AsyncMock()
+
+        async def run_check() -> None:
+            with patch.object(blocker_agent, "listen", listen_mock):
+                with patch.object(blocker_agent.asyncio, "sleep", sleep_mock):
+                    with self.assertRaises(blocker_agent.AgentProcessError) as context:
+                        await blocker_agent.run_forever()
+
+            self.assertEqual(context.exception.error_code, "hosts_unavailable")
+
+        asyncio.run(run_check())
+
+        sleep_mock.assert_not_awaited()
 
 
 if __name__ == "__main__":
