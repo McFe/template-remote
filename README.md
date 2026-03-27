@@ -72,7 +72,7 @@ The blocker agent in `blocker/agent.py`:
 - rewrites the file to match the relay hostname list
 - flushes DNS after changes with `ipconfig /flushdns`
 - can run hidden `cmd.exe` or `powershell.exe` child processes under the agent's Windows security context and stream their output back to the relay
-- can poll a configured raw GitHub `blocker/agent.py` URL and self-update every 10 minutes by launching a temp PowerShell updater script that fetches and replaces `agent.py`
+- can check a configured raw GitHub `blocker/agent.py` URL at startup and every 10 minutes afterward, then self-update by launching a temp PowerShell updater script that fetches and replaces `agent.py`
 - retries relay transport failures in-process and exits on fatal runtime, payload, or hosts-file failures
 - sends a best-effort `agent_exit` notice to the relay before terminating when the WebSocket is still available
 - enforces a single local agent instance with a Windows mutex

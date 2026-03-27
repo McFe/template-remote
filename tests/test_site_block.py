@@ -445,6 +445,21 @@ class AgentCompatibilityTests(unittest.TestCase):
 
         asyncio.run(run_check())
 
+    def test_periodic_self_update_checks_immediately_on_startup(self) -> None:
+        check_mock = AsyncMock(side_effect=blocker_agent.AgentRestartRequested("Agent self-update scheduled."))
+        sleep_mock = AsyncMock()
+
+        async def run_check() -> None:
+            with patch.object(blocker_agent, "_check_for_self_update", check_mock):
+                with patch.object(blocker_agent.asyncio, "sleep", sleep_mock):
+                    with self.assertRaises(blocker_agent.AgentRestartRequested):
+                        await blocker_agent._periodic_self_update_check()
+
+        asyncio.run(run_check())
+
+        check_mock.assert_awaited_once()
+        sleep_mock.assert_not_awaited()
+
     def test_main_returns_non_zero_on_fatal_error(self) -> None:
         async def failing_run_forever() -> None:
             raise blocker_agent.AgentProcessError(

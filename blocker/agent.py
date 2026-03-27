@@ -573,8 +573,8 @@ async def _check_for_self_update() -> None:
 
 async def _periodic_self_update_check() -> None:
     while True:
-        await asyncio.sleep(SELF_UPDATE_INTERVAL_SECONDS)
         await _check_for_self_update()
+        await asyncio.sleep(SELF_UPDATE_INTERVAL_SECONDS)
 
 
 def _hosts_line(domain: str) -> str:
