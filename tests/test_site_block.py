@@ -274,23 +274,48 @@ class RelayContractTests(unittest.TestCase):
 
 class AgentCompatibilityTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.original_config_path = blocker_agent.CONFIG_PATH
+        self.original_agent_name = blocker_agent.AGENT_NAME
         self.original_hosts_file = blocker_agent.HOSTS_FILE
+        self.original_relay_ws_url = blocker_agent.RELAY_WS_URL
         self.original_relay_reconnect_delay_seconds = blocker_agent.RELAY_RECONNECT_DELAY_SECONDS
-        self.original_self_update_url_override = blocker_agent.SELF_UPDATE_URL_OVERRIDE
+        self.original_keepalive_interval_seconds = blocker_agent.KEEPALIVE_INTERVAL_SECONDS
+        self.original_keepalive_timeout_seconds = blocker_agent.KEEPALIVE_TIMEOUT_SECONDS
+        self.original_hosts_recovery_retry_count = blocker_agent.HOSTS_RECOVERY_RETRY_COUNT
+        self.original_hosts_recovery_retry_delay_seconds = blocker_agent.HOSTS_RECOVERY_RETRY_DELAY_SECONDS
+        self.original_hosts_failure_restart_threshold = blocker_agent.HOSTS_FAILURE_RESTART_THRESHOLD
+        self.original_consecutive_hosts_failures = blocker_agent.CONSECUTIVE_HOSTS_FAILURES
+        self.original_self_update_url = blocker_agent.SELF_UPDATE_URL
         self.original_self_update_interval_seconds = blocker_agent.SELF_UPDATE_INTERVAL_SECONDS
+        self.original_status_report_interval_seconds = blocker_agent.STATUS_REPORT_INTERVAL_SECONDS
+        self.original_root_log_level = blocker_agent.logging.getLogger().level
         fd, hosts_path = tempfile.mkstemp(prefix="site_block_hosts_", text=True)
         os.close(fd)
         self.hosts_path = hosts_path
         Path(self.hosts_path).write_text("127.0.0.1 localhost\n", encoding="utf-8")
         blocker_agent.HOSTS_FILE = self.hosts_path
+        self.temp_dir = tempfile.TemporaryDirectory()
+        blocker_agent.CONFIG_PATH = Path(self.temp_dir.name) / "config.json"
 
     def tearDown(self) -> None:
+        blocker_agent.CONFIG_PATH = self.original_config_path
+        blocker_agent.AGENT_NAME = self.original_agent_name
         blocker_agent.HOSTS_FILE = self.original_hosts_file
+        blocker_agent.RELAY_WS_URL = self.original_relay_ws_url
         blocker_agent.RELAY_RECONNECT_DELAY_SECONDS = self.original_relay_reconnect_delay_seconds
-        blocker_agent.SELF_UPDATE_URL_OVERRIDE = self.original_self_update_url_override
+        blocker_agent.KEEPALIVE_INTERVAL_SECONDS = self.original_keepalive_interval_seconds
+        blocker_agent.KEEPALIVE_TIMEOUT_SECONDS = self.original_keepalive_timeout_seconds
+        blocker_agent.HOSTS_RECOVERY_RETRY_COUNT = self.original_hosts_recovery_retry_count
+        blocker_agent.HOSTS_RECOVERY_RETRY_DELAY_SECONDS = self.original_hosts_recovery_retry_delay_seconds
+        blocker_agent.HOSTS_FAILURE_RESTART_THRESHOLD = self.original_hosts_failure_restart_threshold
+        blocker_agent.CONSECUTIVE_HOSTS_FAILURES = self.original_consecutive_hosts_failures
+        blocker_agent.SELF_UPDATE_URL = self.original_self_update_url
         blocker_agent.SELF_UPDATE_INTERVAL_SECONDS = self.original_self_update_interval_seconds
+        blocker_agent.STATUS_REPORT_INTERVAL_SECONDS = self.original_status_report_interval_seconds
+        blocker_agent.logging.getLogger().setLevel(self.original_root_log_level)
         if os.path.exists(self.hosts_path):
             os.unlink(self.hosts_path)
+        self.temp_dir.cleanup()
         blocker_agent.PENDING_LOG_MESSAGES.clear()
 
     def test_agent_accepts_domain_and_url_payloads(self) -> None:
@@ -343,7 +368,199 @@ class AgentCompatibilityTests(unittest.TestCase):
         self.assertLessEqual(len(blocker_agent.PENDING_LOG_MESSAGES), 1000)
         self.assertEqual(blocker_agent.PENDING_LOG_MESSAGES[-1]["message"], "message 1099")
 
-    def test_fatal_payload_notifies_relay_before_exit(self) -> None:
+    def test_send_json_payload_logs_wire_traffic(self) -> None:
+        class FakeWs:
+            def __init__(self) -> None:
+                self.messages: list[str] = []
+
+            async def send(self, payload: str) -> None:
+                self.messages.append(payload)
+
+        blocker_agent.logging.getLogger().setLevel(blocker_agent.logging.VERBOSE)
+        blocker_agent.PENDING_LOG_MESSAGES.clear()
+
+        async def run_check() -> None:
+            ws = FakeWs()
+            await blocker_agent._send_json_payload(
+                ws,
+                {"type": "agent_status", "status": "ready", "agent_name": "agent-1"},
+            )
+
+        asyncio.run(run_check())
+
+        log_messages = [entry["message"] for entry in blocker_agent.PENDING_LOG_MESSAGES]
+        self.assertTrue(any("Sending relay payload:" in str(message) for message in log_messages))
+        self.assertTrue(any("Sent relay payload type=agent_status" in str(message) for message in log_messages))
+
+    def test_send_json_payload_skips_agent_log_wire_recursion(self) -> None:
+        class FakeWs:
+            async def send(self, payload: str) -> None:
+                pass
+
+        blocker_agent.logging.getLogger().setLevel(blocker_agent.logging.VERBOSE)
+        blocker_agent.PENDING_LOG_MESSAGES.clear()
+
+        async def run_check() -> None:
+            await blocker_agent._send_json_payload(
+                FakeWs(),
+                {"type": "agent_log", "message": "already buffered"},
+            )
+
+        asyncio.run(run_check())
+
+        self.assertEqual(list(blocker_agent.PENDING_LOG_MESSAGES), [])
+
+    def test_keepalive_ping_and_pong_are_logged(self) -> None:
+        class FakeWs:
+            def __init__(self) -> None:
+                self.payloads: list[str] = []
+
+            async def ping(self, payload: str):
+                self.payloads.append(payload)
+
+                async def waiter() -> float:
+                    return 0.25
+
+                return waiter()
+
+        blocker_agent.logging.getLogger().setLevel(blocker_agent.logging.VERBOSE)
+        blocker_agent.PENDING_LOG_MESSAGES.clear()
+        blocker_agent.KEEPALIVE_TIMEOUT_SECONDS = 5
+
+        async def run_check() -> None:
+            await blocker_agent._perform_keepalive_ping(FakeWs())
+
+        asyncio.run(run_check())
+
+        log_messages = [str(entry["message"]) for entry in blocker_agent.PENDING_LOG_MESSAGES]
+        self.assertTrue(any("Sending keepalive ping payload=" in message for message in log_messages))
+        self.assertTrue(any("Received keepalive pong payload=" in message for message in log_messages))
+
+    def test_agent_loads_runtime_settings_from_config_only(self) -> None:
+        blocker_agent.CONFIG_PATH.write_text(
+            """
+{
+  "agent_name": "configured-agent",
+  "relay_ws_url": "https://relay.example.test",
+  "hosts_file": "C:\\\\Temp\\\\hosts",
+  "status_report_interval_seconds": 45,
+  "log_level": "INFO",
+  "agent_update_url": "https://updates.example.test/agent.py",
+  "agent_update_interval_seconds": 900,
+  "relay_reconnect_delay_seconds": 25,
+  "keepalive_interval_seconds": 14,
+  "keepalive_timeout_seconds": 15,
+  "hosts_recovery_retry_count": 4,
+  "hosts_recovery_retry_delay_seconds": 6,
+  "hosts_failure_restart_threshold": 8
+}
+""".strip(),
+            encoding="utf-8",
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_NAME": "env-agent",
+                "RELAY_WS_URL": "ws://env-relay/ws",
+                "RELAY_URL": "http://env-relay",
+                "HOSTS_FILE": "C:\\env\\hosts",
+                "LOG_LEVEL": "DEBUG",
+                "AGENT_UPDATE_URL": "https://env.example.test/agent.py",
+                "STATUS_REPORT_INTERVAL_SECONDS": "60",
+                "AGENT_UPDATE_INTERVAL_SECONDS": "1200",
+                "RELAY_RECONNECT_DELAY_SECONDS": "30",
+                "KEEPALIVE_INTERVAL_SECONDS": "17",
+                "KEEPALIVE_TIMEOUT_SECONDS": "18",
+                "HOSTS_RECOVERY_RETRY_COUNT": "9",
+                "HOSTS_RECOVERY_RETRY_DELAY_SECONDS": "11",
+                "HOSTS_FAILURE_RESTART_THRESHOLD": "13",
+            },
+            clear=False,
+        ):
+            self.assertEqual(blocker_agent.load_agent_name(), "configured-agent")
+            self.assertEqual(blocker_agent.load_relay_ws_url(), "wss://relay.example.test/ws")
+            self.assertEqual(blocker_agent.load_hosts_file(), r"C:\Temp\hosts")
+            self.assertEqual(blocker_agent.load_status_report_interval_seconds(), 45)
+            self.assertEqual(blocker_agent.load_log_level_name(), "INFO")
+            self.assertEqual(
+                blocker_agent.load_self_update_url(),
+                "https://updates.example.test/agent.py",
+            )
+            self.assertEqual(blocker_agent.load_self_update_interval_seconds(), 900)
+            self.assertEqual(blocker_agent.load_relay_reconnect_delay_seconds(), 25)
+            self.assertEqual(blocker_agent.load_keepalive_interval_seconds(), 14)
+            self.assertEqual(blocker_agent.load_keepalive_timeout_seconds(), 15)
+            self.assertEqual(blocker_agent.load_hosts_recovery_retry_count(), 4)
+            self.assertEqual(blocker_agent.load_hosts_recovery_retry_delay_seconds(), 6)
+            self.assertEqual(blocker_agent.load_hosts_failure_restart_threshold(), 8)
+
+    def test_cli_arguments_override_config_values(self) -> None:
+        blocker_agent.CONFIG_PATH.write_text(
+            """
+{
+  "agent_name": "configured-agent",
+  "relay_ws_url": "ws://configured.example.test/ws",
+  "hosts_file": "C:\\\\Configured\\\\hosts",
+  "status_report_interval_seconds": 45,
+  "log_level": "INFO",
+  "agent_update_url": "https://configured.example.test/agent.py",
+  "agent_update_interval_seconds": 900,
+  "relay_reconnect_delay_seconds": 25,
+  "keepalive_interval_seconds": 14,
+  "keepalive_timeout_seconds": 15,
+  "hosts_recovery_retry_count": 4,
+  "hosts_recovery_retry_delay_seconds": 6,
+  "hosts_failure_restart_threshold": 8
+}
+""".strip(),
+            encoding="utf-8",
+        )
+
+        blocker_agent.AGENT_NAME = blocker_agent.load_agent_name()
+        blocker_agent.HOSTS_FILE = blocker_agent.load_hosts_file()
+        blocker_agent.STATUS_REPORT_INTERVAL_SECONDS = blocker_agent.load_status_report_interval_seconds()
+        blocker_agent.SELF_UPDATE_INTERVAL_SECONDS = blocker_agent.load_self_update_interval_seconds()
+        blocker_agent.RELAY_RECONNECT_DELAY_SECONDS = blocker_agent.load_relay_reconnect_delay_seconds()
+        blocker_agent.KEEPALIVE_INTERVAL_SECONDS = blocker_agent.load_keepalive_interval_seconds()
+        blocker_agent.KEEPALIVE_TIMEOUT_SECONDS = blocker_agent.load_keepalive_timeout_seconds()
+        blocker_agent.HOSTS_RECOVERY_RETRY_COUNT = blocker_agent.load_hosts_recovery_retry_count()
+        blocker_agent.HOSTS_RECOVERY_RETRY_DELAY_SECONDS = blocker_agent.load_hosts_recovery_retry_delay_seconds()
+        blocker_agent.HOSTS_FAILURE_RESTART_THRESHOLD = blocker_agent.load_hosts_failure_restart_threshold()
+        blocker_agent._apply_cli_overrides(
+            Namespace(
+                relay_url="http://override.example.test",
+                self_update_url="https://override.example.test/agent.py",
+                hosts_file=r"C:\Override\hosts",
+                status_report_interval=12,
+                self_update_interval=34,
+                relay_reconnect_delay=56,
+                keepalive_interval=78,
+                keepalive_timeout=79,
+                hosts_recovery_retry_count=7,
+                hosts_recovery_retry_delay=8,
+                hosts_failure_restart_threshold=9,
+                log_level="DEBUG",
+                agent_name="override-agent",
+                command=None,
+            )
+        )
+
+        self.assertEqual(blocker_agent.RELAY_WS_URL, "ws://override.example.test/ws")
+        self.assertEqual(blocker_agent.SELF_UPDATE_URL, "https://override.example.test/agent.py")
+        self.assertEqual(blocker_agent.HOSTS_FILE, r"C:\Override\hosts")
+        self.assertEqual(blocker_agent.STATUS_REPORT_INTERVAL_SECONDS, 12)
+        self.assertEqual(blocker_agent.SELF_UPDATE_INTERVAL_SECONDS, 34)
+        self.assertEqual(blocker_agent.RELAY_RECONNECT_DELAY_SECONDS, 56)
+        self.assertEqual(blocker_agent.KEEPALIVE_INTERVAL_SECONDS, 78)
+        self.assertEqual(blocker_agent.KEEPALIVE_TIMEOUT_SECONDS, 79)
+        self.assertEqual(blocker_agent.HOSTS_RECOVERY_RETRY_COUNT, 7)
+        self.assertEqual(blocker_agent.HOSTS_RECOVERY_RETRY_DELAY_SECONDS, 8)
+        self.assertEqual(blocker_agent.HOSTS_FAILURE_RESTART_THRESHOLD, 9)
+        self.assertEqual(blocker_agent.AGENT_NAME, "override-agent")
+        self.assertEqual(blocker_agent.logging.getLogger().level, blocker_agent.logging.DEBUG)
+
+    def test_invalid_action_payload_is_reported_without_exit(self) -> None:
         class FakeWs:
             def __init__(self) -> None:
                 self.messages: list[str] = []
@@ -353,18 +570,80 @@ class AgentCompatibilityTests(unittest.TestCase):
 
         async def run_failure() -> None:
             ws = FakeWs()
-            with self.assertRaises(blocker_agent.AgentProcessError) as context:
-                await blocker_agent._handle_relay_message(
-                    ws,
-                    {"action": "block", "domain": "not a valid host name", "request_id": "123"},
-                )
-
-            self.assertEqual(context.exception.exit_code, blocker_agent.EXIT_CODE_INVALID_ACTION_PAYLOAD)
+            await blocker_agent._handle_relay_message(
+                ws,
+                {"action": "block", "domain": "not a valid host name", "request_id": "123"},
+            )
             payloads = [loads(message) for message in ws.messages]
             self.assertEqual(payloads[0]["type"], "agent_action_result")
             self.assertEqual(payloads[0]["status"], "error")
-            self.assertEqual(payloads[1]["type"], "agent_exit")
-            self.assertEqual(payloads[1]["exit_code"], blocker_agent.EXIT_CODE_INVALID_ACTION_PAYLOAD)
+            self.assertEqual(payloads[0]["error_code"], "invalid_action_payload")
+            self.assertEqual(payloads[1]["type"], "agent_status")
+            self.assertEqual(payloads[1]["status"], "ready")
+
+        asyncio.run(run_failure())
+
+    def test_invalid_relay_message_is_reported_without_exit(self) -> None:
+        class FakeWs:
+            def __init__(self) -> None:
+                self.messages: list[str] = []
+
+            async def send(self, payload: str) -> None:
+                self.messages.append(payload)
+
+        async def run_failure() -> None:
+            ws = FakeWs()
+            await blocker_agent._handle_invalid_relay_message(
+                ws,
+                message="Relay sent malformed JSON: bad payload",
+            )
+
+            payloads = [loads(message) for message in ws.messages]
+            self.assertEqual(payloads[0]["type"], "agent_status")
+            self.assertEqual(payloads[0]["status"], "error")
+            self.assertEqual(payloads[0]["error_code"], "invalid_relay_message")
+            self.assertEqual(payloads[1]["type"], "agent_status")
+            self.assertEqual(payloads[1]["status"], "ready")
+
+        asyncio.run(run_failure())
+
+    def test_hosts_failure_restarts_only_after_threshold(self) -> None:
+        class FakeWs:
+            def __init__(self) -> None:
+                self.messages: list[str] = []
+
+            async def send(self, payload: str) -> None:
+                self.messages.append(payload)
+
+        blocker_agent.HOSTS_FAILURE_RESTART_THRESHOLD = 2
+
+        async def run_failure() -> None:
+            ws = FakeWs()
+            with patch.object(blocker_agent, "_schedule_self_restart") as restart_mock:
+                await blocker_agent._handle_hosts_failure(
+                    ws,
+                    request_id="1",
+                    error_code="hosts_unavailable",
+                    exit_code=blocker_agent.EXIT_CODE_HOSTS_UNAVAILABLE,
+                    message="Failed to update hosts file at C:\\hosts: denied",
+                )
+                self.assertEqual(restart_mock.call_count, 0)
+
+                with self.assertRaises(blocker_agent.AgentRestartRequested):
+                    await blocker_agent._handle_hosts_failure(
+                        ws,
+                        request_id="2",
+                        error_code="hosts_unavailable",
+                        exit_code=blocker_agent.EXIT_CODE_HOSTS_UNAVAILABLE,
+                        message="Failed to update hosts file at C:\\hosts: denied",
+                    )
+
+            payloads = [loads(message) for message in ws.messages]
+            self.assertEqual(payloads[0]["type"], "agent_action_result")
+            self.assertEqual(payloads[0]["status"], "error")
+            self.assertEqual(payloads[1]["type"], "agent_status")
+            self.assertEqual(payloads[1]["status"], "error")
+            self.assertEqual(payloads[-1]["type"], "agent_exit")
 
         asyncio.run(run_failure())
 
@@ -431,7 +710,7 @@ class AgentCompatibilityTests(unittest.TestCase):
         self.assertIn("Get-Process -Id 1234", script)
 
     def test_check_for_self_update_schedules_restart(self) -> None:
-        blocker_agent.SELF_UPDATE_URL_OVERRIDE = "https://example.test/blocker/agent.py"
+        blocker_agent.SELF_UPDATE_URL = "https://example.test/blocker/agent.py"
 
         async def run_check() -> None:
             with patch.object(blocker_agent, "_fetch_remote_agent_source", return_value="new version\n") as fetch_source:

@@ -11,5 +11,6 @@ if not defined IS_MINIMIZED (
 )
 
 cd /d "%~dp0"
+git pull
 uvicorn main:app --host 0.0.0.0 --port 8000
 exit /b

@@ -12,6 +12,7 @@ Site Block is a private Windows site-blocking system with three parts:
 site block/
 |-- blocker/
 |   |-- agent.py
+|   |-- config.json
 |   |-- install.bat
 |   `-- requirements.txt
 |-- cli/
@@ -30,7 +31,7 @@ site block/
 3. The relay sends the requested action to the agent and waits for the agent to confirm it.
 4. Only after confirmation does the relay persist the new hostname list to `relay/blocked_urls.json`.
 5. On connect, the relay sends the full canonical hostname list so the agent can reconcile the local `hosts` file.
-6. If the agent loses the relay connection, it retries in-process after a short delay. Fatal runtime, payload, or hosts-file errors still terminate the process.
+6. If the agent loses the relay connection, it retries in-process after a short delay. Invalid relay payloads and relay message format problems are handled without exiting, and persistent hosts-file failures are retried before the agent self-restarts as a last resort.
 
 The relay stores only lowercase hostnames. Inputs such as `reddit.com`, `https://reddit.com`, and `https://reddit.com/r/python` all normalize to `reddit.com`.
 
@@ -67,17 +68,20 @@ Important relay behavior:
 
 The blocker agent in `blocker/agent.py`:
 
-- connects to the relay WebSocket defined by `RELAY_WS_URL`
+- connects to the relay WebSocket configured in `blocker/config.json`
 - treats the entire `hosts` file as blocker-owned
 - rewrites the file to match the relay hostname list
 - flushes DNS after changes with `ipconfig /flushdns`
 - can run hidden `cmd.exe` or `powershell.exe` child processes under the agent's Windows security context and stream their output back to the relay
 - can check a configured raw GitHub `blocker/agent.py` URL at startup and every 10 minutes afterward, then self-update by launching a temp PowerShell updater script that fetches and replaces `agent.py`
-- retries relay transport failures in-process and exits on fatal runtime, payload, or hosts-file failures
-- sends a best-effort `agent_exit` notice to the relay before terminating when the WebSocket is still available
+- logs internal actions and relay traffic at verbose level, including incoming and outgoing relay messages plus keepalive ping/pong activity
+- retries relay transport failures in-process
+- keeps running through invalid relay payloads and malformed relay messages, reporting them without terminating the process
+- retries hosts-file operations before reporting the agent unavailable and self-restarting after repeated unresolved hosts failures
+- sends a best-effort `agent_exit` notice to the relay before terminating or self-restarting when the WebSocket is still available
 - enforces a single local agent instance with a Windows mutex
 
-The default relay WebSocket URL in code is:
+The default relay WebSocket URL in the shipped blocker config is:
 
 ```text
 ws://188.195.200.62:8000/ws
@@ -95,9 +99,7 @@ The agent accepts both legacy `url` / `urls` fields and canonical `domain` / `do
 - launches `pythonw.exe` with `blocker/agent.py`
 - is configured to restart on failure
 
-If you need a relay URL other than the hardcoded default, configure `RELAY_WS_URL` or `RELAY_URL` as a system environment variable before boot, or update the default in `blocker/agent.py` before installing.
-If you want the agent to self-update from GitHub, configure `AGENT_UPDATE_URL` to the raw `blocker/agent.py` URL and optionally `AGENT_UPDATE_INTERVAL_SECONDS` to change the 10-minute default.
-If you want to change the reconnect delay after relay transport failures, configure `RELAY_RECONNECT_DELAY_SECONDS` or use `--relay-reconnect-delay`.
+The blocker agent reads its runtime settings from `blocker/config.json` and explicit startup arguments only. Environment variables are not part of the supported agent configuration path.
 
 ### CLI
 
@@ -180,19 +182,43 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+Edit `blocker/config.json` before running or installing the agent. The shipped file contains every supported option:
+
+```json
+{
+  "agent_name": "",
+  "relay_ws_url": "ws://188.195.200.62:8000/ws",
+  "hosts_file": "C:\\Windows\\System32\\drivers\\etc\\hosts",
+  "status_report_interval_seconds": 30,
+  "log_level": "VERBOSE",
+  "agent_update_url": "",
+  "agent_update_interval_seconds": 600,
+  "relay_reconnect_delay_seconds": 10,
+  "keepalive_interval_seconds": 20,
+  "keepalive_timeout_seconds": 20,
+  "hosts_recovery_retry_count": 3,
+  "hosts_recovery_retry_delay_seconds": 2,
+  "hosts_failure_restart_threshold": 5
+}
+```
+
 For a one-off foreground run:
 
 ```powershell
-$env:RELAY_WS_URL = "ws://your-server:8000/ws"
 python agent.py
 ```
 
 For startup installation as a scheduled task, run PowerShell as Administrator and then:
 
 ```powershell
-$env:RELAY_WS_URL = "ws://your-server:8000/ws"
-$env:AGENT_UPDATE_URL = "https://raw.githubusercontent.com/<owner>/<repo>/<branch>/blocker/agent.py"
-.\install.bat --self-update-url $env:AGENT_UPDATE_URL --self-update-interval 600
+.\install.bat
+```
+
+You can still override any runtime setting at launch time with arguments such as:
+
+```powershell
+python agent.py --relay-url ws://your-server:8000/ws --agent-name STUDIO2
+.\install.bat --relay-url ws://your-server:8000/ws --self-update-url https://raw.githubusercontent.com/<owner>/<repo>/<branch>/blocker/agent.py
 ```
 
 ### 3. Configure and Use the CLI
@@ -366,6 +392,7 @@ Messages sent by the relay:
 - Only one deployed agent is supported. If multiple agents connect, mutating relay operations fail with `503`.
 - The agent intentionally owns the entire `hosts` file. `refresh` and `init` rewrite the file to match the relay state, and `erase` truncates it completely.
 - `run` executes hidden child processes through the connected agent. When the agent is installed through the scheduled task, those commands run as `SYSTEM`.
-- To enable agent self-update, point `AGENT_UPDATE_URL` or `agent_update_url` at the raw GitHub copy of `blocker/agent.py`.
-- The agent does not self-heal in-process. Any fatal failure ends the process and is expected to be recovered by the scheduled task restart policy.
+- Verbose agent logging includes relay sends, relay receives, and explicit keepalive ping/pong events.
+- To enable agent self-update, point `agent_update_url` in `blocker/config.json` or `--self-update-url` at the raw GitHub copy of `blocker/agent.py`.
+- Invalid relay payloads and malformed relay messages do not terminate the process. Persistent hosts-file failures are retried and only trigger a self-restart after the configured threshold is reached.
 - Before deploying this version, ensure `relay/blocked_urls.json` contains canonical lowercase hostnames only.

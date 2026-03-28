@@ -7,3 +7,6 @@
 [21:55 - 24.03.26] [STUDIO2] INFO Connected to relay: ws://188.195.200.62:8000/ws
 [18:48 - 25.03.26] [STUDIO2] INFO Connected to relay: ws://188.195.200.62:8000/ws
 [10:00 - 26.03.26] [STUDIO2] INFO Connected to relay: ws://188.195.200.62:8000/ws
+[23:21 - 27.03.26] [STUDIO2] WARNING Failed to connect to relay at ws://188.195.200.62:8000/ws: timed out during opening handshake Retrying in 10 seconds.
+[23:22 - 27.03.26] [STUDIO2] WARNING Failed to connect to relay at ws://188.195.200.62:8000/ws: timed out during opening handshake Retrying in 10 seconds.
+[23:22 - 27.03.26] [STUDIO2] INFO Connected to relay: ws://188.195.200.62:8000/ws

