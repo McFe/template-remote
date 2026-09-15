@@ -175,9 +175,7 @@ def configure_relay_log_buffering() -> None:
     if any(isinstance(handler, RelayLogBufferHandler) for handler in root_logger.handlers):
         return
 
-    handler = RelayLogBufferHandler()[11:15 - 15.09.26] [studio2] [f6452b81-90fb-4142-b864-d264dd663e34] [cmd] META Starting cmd.exe /d /c taskkill -f -im \"adguard*\"
-[11:15 - 15.09.26] [studio2] [f6452b81-90fb-4142-b864-d264dd663e34] [cmd] STDERR ERROR: Invalid query
-[11:15 - 15.09.26] [studio2] [f6452b81-90fb-4142-b864-d264dd663e34] [cmd] META Command exited with code 1.
+    handler = RelayLogBufferHandler()
     handler.setLevel(logging.NOTSET)
     handler.setFormatter(logging.Formatter("%(message)s"))
     root_logger.addHandler(handler)
@@ -1202,11 +1200,13 @@ def _build_shell_invocation(shell: str, arguments: list[str]) -> tuple[str, list
         if any(argument == "/k" for argument in lowered_arguments):
             raise ValueError("cmd shell runs must use /c, not /k.")
 
-        # cmd.exe expects the command following /c to be parsed as one
-        # command line. Keep the individual arguments intact while allowing
-        # literal quotes inside an argument to survive.
-        command_line = " ".join(arguments)
-        return "cmd.exe", ["/d", "/c", command_line]
+        invocation_arguments = list(arguments)
+        if "/d" not in lowered_arguments:
+            invocation_arguments.insert(0, "/d")
+        if "/c" not in lowered_arguments:
+            invocation_arguments.insert(1 if invocation_arguments and invocation_arguments[0].lower() == "/d" else 0, "/c")
+
+        return "cmd.exe", invocation_arguments
 
     lowered_arguments = [argument.lower() for argument in arguments]
     if any(argument == "-noexit" for argument in lowered_arguments):
